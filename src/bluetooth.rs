@@ -180,40 +180,54 @@ pub async fn start_background_manager() -> Result<BudsManager> {
     let show_gui_flag = Arc::new(AtomicBool::new(false));
     let quit_flag = Arc::new(AtomicBool::new(false));
 
-    // Spawn IPC server so CLI commands can talk to the active daemon/GUI
+    // Bind IPC socket immediately so GUI client and CLI commands can connect without race conditions
+    let _ = std::fs::remove_file(IPC_SOCKET_PATH);
+    let listener = UnixListener::bind(IPC_SOCKET_PATH)
+        .context("Falha ao criar socket IPC em /tmp/buds4pro-manager.sock")?;
+
     let ipc_state = state.clone();
     let ipc_tx = cmd_tx.clone();
+    let ipc_show_gui = show_gui_flag.clone();
+    let ipc_quit = quit_flag.clone();
     tokio::spawn(async move {
-        let _ = std::fs::remove_file(IPC_SOCKET_PATH);
-        if let Ok(listener) = UnixListener::bind(IPC_SOCKET_PATH) {
-            loop {
-                if let Ok((stream, _)) = listener.accept().await {
-                    let st = ipc_state.clone();
-                    let tx = ipc_tx.clone();
-                    tokio::spawn(async move {
-                        let mut reader = BufReader::new(stream);
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                            if let Ok(cmd) = serde_json::from_str::<UserCommand>(line.trim()) {
-                                let is_get = matches!(cmd, UserCommand::GetStatus);
-                                if !is_get {
-                                    let _ = tx.send(cmd);
-                                    tokio::time::sleep(Duration::from_millis(80)).await;
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let st = ipc_state.clone();
+                let tx = ipc_tx.clone();
+                let show_flag = ipc_show_gui.clone();
+                let q_flag = ipc_quit.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        if let Ok(cmd) = serde_json::from_str::<UserCommand>(line.trim()) {
+                            match cmd {
+                                UserCommand::GetStatus => {}
+                                UserCommand::ShowGui => {
+                                    show_flag.store(true, Ordering::SeqCst);
                                 }
-                                let snapshot = st.read().await.clone();
-                                let resp = IpcResponse {
-                                    ok: true,
-                                    message: "OK".to_string(),
-                                    state: snapshot,
-                                };
-                                if let Ok(json) = serde_json::to_string(&resp) {
-                                    let mut inner = reader.into_inner();
-                                    let _ = inner.write_all(format!("{json}\n").as_bytes()).await;
+                                UserCommand::QuitDaemon => {
+                                    q_flag.store(true, Ordering::SeqCst);
+                                    let _ = tx.send(cmd);
+                                }
+                                _ => {
+                                    let _ = tx.send(cmd);
+                                    tokio::time::sleep(Duration::from_millis(45)).await;
                                 }
                             }
+                            let snapshot = st.read().await.clone();
+                            let resp = IpcResponse {
+                                ok: true,
+                                message: "OK".to_string(),
+                                state: snapshot,
+                            };
+                            if let Ok(json) = serde_json::to_string(&resp) {
+                                let mut inner = reader.into_inner();
+                                let _ = inner.write_all(format!("{json}\n").as_bytes()).await;
+                            }
                         }
-                    });
-                }
+                    }
+                });
             }
         }
     });
@@ -395,17 +409,23 @@ pub async fn start_background_manager() -> Result<BudsManager> {
     })
 }
 
+/// Sends a command to the running daemon via Unix socket if available.
+pub async fn send_ipc_only(cmd: &UserCommand) -> Result<Buds4ProState> {
+    let mut stream = UnixStream::connect(IPC_SOCKET_PATH).await?;
+    let payload = format!("{}\n", serde_json::to_string(cmd)?);
+    stream.write_all(payload.as_bytes()).await?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let resp: IpcResponse =
+        serde_json::from_str(line.trim()).context("Resposta IPC inválida")?;
+    Ok(resp.state)
+}
+
 /// Sends a command to the running daemon via Unix socket, or executes a one-shot Bluetooth session if no daemon is running.
 pub async fn send_or_execute_oneshot(cmd: UserCommand) -> Result<Buds4ProState> {
-    if let Ok(mut stream) = UnixStream::connect(IPC_SOCKET_PATH).await {
-        let payload = format!("{}\n", serde_json::to_string(&cmd)?);
-        stream.write_all(payload.as_bytes()).await?;
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        let resp: IpcResponse =
-            serde_json::from_str(line.trim()).context("Resposta IPC inválida")?;
-        return Ok(resp.state);
+    if let Ok(state) = send_ipc_only(&cmd).await {
+        return Ok(state);
     }
 
     // No daemon running: run a quick direct Bluetooth connection

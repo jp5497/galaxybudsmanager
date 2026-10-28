@@ -1,6 +1,7 @@
 use crate::ipc::UserCommand;
 use crate::protocol::{Buds4ProState, EqualizerPreset, NoiseControlMode};
 use ksni::menu::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -18,6 +19,8 @@ fn custom_tray_pixmap() -> Vec<ksni::Icon> {
 pub struct BudsTray {
     pub snapshot: Buds4ProState,
     pub cmd_tx: mpsc::UnboundedSender<UserCommand>,
+    pub show_gui_flag: Arc<AtomicBool>,
+    pub quit_flag: Arc<AtomicBool>,
     pub show_gui_option: bool,
 }
 
@@ -73,6 +76,7 @@ impl ksni::Tray for BudsTray {
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
+        self.show_gui_flag.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.send(UserCommand::ShowGui);
     }
 
@@ -86,6 +90,7 @@ impl ksni::Tray for BudsTray {
                     label: "Abrir Painel Gráfico (GUI)".to_string(),
                     icon_name: "preferences-desktop-sound".to_string(),
                     activate: Box::new(|this: &mut Self| {
+                        this.show_gui_flag.store(true, Ordering::SeqCst);
                         let _ = this.cmd_tx.send(UserCommand::ShowGui);
                     }),
                     ..Default::default()
@@ -241,11 +246,11 @@ impl ksni::Tray for BudsTray {
 
         items.push(
             StandardItem {
-                label: "Sair".to_string(),
+                label: "Sair Completamente".to_string(),
                 icon_name: "application-exit".to_string(),
                 activate: Box::new(|this: &mut Self| {
+                    this.quit_flag.store(true, Ordering::SeqCst);
                     let _ = this.cmd_tx.send(UserCommand::QuitDaemon);
-                    std::process::exit(0);
                 }),
                 ..Default::default()
             }
@@ -259,12 +264,16 @@ impl ksni::Tray for BudsTray {
 pub fn spawn_system_tray(
     state: Arc<RwLock<Buds4ProState>>,
     cmd_tx: mpsc::UnboundedSender<UserCommand>,
+    show_gui_flag: Arc<AtomicBool>,
+    quit_flag: Arc<AtomicBool>,
     show_gui_option: bool,
 ) {
     let initial = Buds4ProState::default();
     let service = ksni::TrayService::new(BudsTray {
         snapshot: initial,
         cmd_tx,
+        show_gui_flag,
+        quit_flag,
         show_gui_option,
     });
     let handle = service.handle();

@@ -5,13 +5,15 @@ mod protocol;
 mod tray;
 
 use anyhow::Result;
-use bluetooth::{send_or_execute_oneshot, start_background_manager};
+use bluetooth::{send_ipc_only, send_or_execute_oneshot, start_background_manager};
 use clap::{Parser, Subcommand, ValueEnum};
 use gui::BudsGuiApp;
 use ipc::UserCommand;
 use protocol::{Buds4ProState, EqualizerPreset, NoiseControlMode};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{mpsc, RwLock};
 use tray::spawn_system_tray;
 
 #[derive(Parser)]
@@ -35,6 +37,9 @@ enum Commands {
     Gui,
     /// Inicia apenas o daemon em segundo plano + ícone na bandeja do sistema (System Tray)
     Daemon,
+    /// Processo interno da janela gráfica conectado ao daemon na bandeja
+    #[command(hide = true)]
+    GuiWindow,
     /// Mostra o status completo dos fones (bateria, sensores, modo de ruído, equalizador)
     Status,
     /// Define ou alterna o modo de Controle de Ruído (off, anc, ambient, adaptive, cycle)
@@ -251,16 +256,54 @@ fn print_status(s: &Buds4ProState, as_json: bool) {
     println!("╰──────────────────────────────────────────────────────────╯");
 }
 
-fn run_gui_mode() -> Result<()> {
+/// Runs the native GUI window connected via IPC to the background tray daemon.
+/// Closing this window only closes the UI; the System Tray & Bluetooth daemon stay alive.
+fn run_gui_window_client() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    let mgr = rt.block_on(async {
-        let m = start_background_manager().await?;
-        spawn_system_tray(m.state.clone(), m.cmd_tx.clone(), true);
-        Ok::<_, anyhow::Error>(m)
-    })?;
+    let initial_state = rt
+        .block_on(send_ipc_only(&UserCommand::GetStatus))
+        .unwrap_or_default();
+
+    let state = Arc::new(RwLock::new(initial_state));
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UserCommand>();
+    let show_gui_flag = Arc::new(AtomicBool::new(false));
+    let quit_flag = Arc::new(AtomicBool::new(false));
+
+    let bg_state = state.clone();
+    let bg_quit = quit_flag.clone();
+    rt.spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(90));
+        let mut consecutive_failures = 0u8;
+
+        loop {
+            tokio::select! {
+                Some(cmd) = cmd_rx.recv() => {
+                    if let Ok(new_state) = send_ipc_only(&cmd).await {
+                        *bg_state.write().await = new_state;
+                        consecutive_failures = 0;
+                    }
+                }
+                _ = ticker.tick() => {
+                    match send_ipc_only(&UserCommand::GetStatus).await {
+                        Ok(new_state) => {
+                            *bg_state.write().await = new_state;
+                            consecutive_failures = 0;
+                        }
+                        Err(_) => {
+                            consecutive_failures += 1;
+                            if consecutive_failures > 6 {
+                                bg_quit.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     let icon_data = std::sync::Arc::new(eframe::egui::IconData {
         rgba: include_bytes!("../assets/window_icon_64.rgba").to_vec(),
@@ -278,11 +321,6 @@ fn run_gui_mode() -> Result<()> {
         ..Default::default()
     };
 
-    let state = mgr.state.clone();
-    let cmd_tx = mgr.cmd_tx.clone();
-    let show_gui_flag = mgr.show_gui_flag.clone();
-    let quit_flag = mgr.quit_flag.clone();
-
     eframe::run_native(
         "buds4pro",
         native_options,
@@ -298,20 +336,64 @@ fn run_gui_mode() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("Erro ao iniciar GUI: {e}"))?;
 
-    let _ = std::fs::remove_file(ipc::IPC_SOCKET_PATH);
     Ok(())
 }
 
-async fn run_daemon_mode() -> Result<()> {
+async fn run_daemon_with_tray(open_gui_initially: bool) -> Result<()> {
+    // If the tray daemon is already running, just ask it to open the GUI window and exit!
+    let check_cmd = if open_gui_initially {
+        UserCommand::ShowGui
+    } else {
+        UserCommand::GetStatus
+    };
+    if send_ipc_only(&check_cmd).await.is_ok() {
+        return Ok(());
+    }
+
     let mgr = start_background_manager().await?;
-    spawn_system_tray(mgr.state.clone(), mgr.cmd_tx.clone(), false);
-    println!(
-        "🚀 Daemon Galaxy Buds4 Pro iniciado! Ícone disponível na bandeja do sistema (System Tray)."
+    spawn_system_tray(
+        mgr.state.clone(),
+        mgr.cmd_tx.clone(),
+        mgr.show_gui_flag.clone(),
+        mgr.quit_flag.clone(),
+        true,
     );
-    println!("   Socket IPC ativo em: {}", ipc::IPC_SOCKET_PATH);
+
+    if open_gui_initially {
+        mgr.show_gui_flag.store(true, Ordering::SeqCst);
+    } else {
+        println!(
+            "🚀 Daemon Galaxy Buds4 Pro iniciado! Ícone disponível na bandeja do sistema (System Tray)."
+        );
+        println!("   Socket IPC ativo em: {}", ipc::IPC_SOCKET_PATH);
+    }
+
+    let mut gui_child: Option<std::process::Child> = None;
 
     while !mgr.quit_flag.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Some(child) = &mut gui_child {
+            if let Ok(Some(_)) = child.try_wait() {
+                gui_child = None;
+            }
+        }
+
+        if mgr.show_gui_flag.swap(false, Ordering::SeqCst) && gui_child.is_none() {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Ok(child) = std::process::Command::new(exe)
+                    .arg("gui-window")
+                    .spawn()
+                {
+                    gui_child = Some(child);
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    if let Some(mut child) = gui_child {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     let _ = std::fs::remove_file(ipc::IPC_SOCKET_PATH);
@@ -322,13 +404,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Commands::Gui) {
-        Commands::Gui => run_gui_mode(),
+        Commands::Gui => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_daemon_with_tray(true))
+        }
         Commands::Daemon => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_daemon_mode())
+            rt.block_on(run_daemon_with_tray(false))
         }
+        Commands::GuiWindow => run_gui_window_client(),
         cmd => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -397,7 +485,7 @@ fn main() -> Result<()> {
                         let start = action == StartStop::Start;
                         send_or_execute_oneshot(UserCommand::SetFindMyBuds(start)).await?
                     }
-                    Commands::Gui | Commands::Daemon => unreachable!(),
+                    Commands::Gui | Commands::Daemon | Commands::GuiWindow => unreachable!(),
                 };
 
                 print_status(&state, cli.json);
