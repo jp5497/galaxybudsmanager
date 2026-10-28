@@ -243,10 +243,18 @@ fn run_gui_mode() -> Result<()> {
         Ok::<_, anyhow::Error>(m)
     })?;
 
+    let icon_data = std::sync::Arc::new(eframe::egui::IconData {
+        rgba: include_bytes!("../assets/window_icon_64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    });
+
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([760.0, 740.0])
             .with_min_inner_size([640.0, 620.0])
+            .with_app_id("buds4pro")
+            .with_icon(icon_data)
             .with_title("Galaxy Buds4 Pro — Gerenciador Linux"),
         ..Default::default()
     };

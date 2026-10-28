@@ -1343,6 +1343,31 @@ impl eframe::App for BudsGuiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // --- Top App Header Bar ---
             ui.horizontal(|ui| {
+                // Custom App Icon Badge in Header
+                let (logo_rect, _) = ui.allocate_exact_size(Vec2::new(42.0, 42.0), Sense::hover());
+                ui.painter().rect(
+                    logo_rect,
+                    CornerRadius::same(11),
+                    Color32::from_rgb(17, 26, 46),
+                    Stroke::new(1.2_f32, Color32::from_rgb(56, 189, 248)),
+                    egui::StrokeKind::Inside,
+                );
+                let lc = logo_rect.center();
+                // Left mini blade bud
+                ui.painter().circle_filled(Pos2::new(lc.x - 6.0, lc.y - 6.0), 4.8, TEXT_PRIMARY);
+                ui.painter().line_segment(
+                    [Pos2::new(lc.x - 7.5, lc.y - 4.0), Pos2::new(lc.x - 4.5, lc.y + 10.0)],
+                    Stroke::new(3.0_f32, ACCENT_CYAN),
+                );
+                // Right mini blade bud
+                ui.painter().circle_filled(Pos2::new(lc.x + 6.0, lc.y - 6.0), 4.8, TEXT_PRIMARY);
+                ui.painter().line_segment(
+                    [Pos2::new(lc.x + 7.5, lc.y - 4.0), Pos2::new(lc.x + 4.5, lc.y + 10.0)],
+                    Stroke::new(3.0_f32, ACCENT_CYAN),
+                );
+
+                ui.add_space(4.0);
+
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.label(

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="metal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F8FAFC"/>
+      <stop offset="100%" stop-color="#94A3B8"/>
+    </linearGradient>
+    <linearGradient id="cyanLed" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#67E8F9"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Left Earbud (High Contrast Tray Silhouette) -->
+  <g>
+    <ellipse cx="26" cy="19" rx="6.5" ry="7.5" transform="rotate(22 26 19)" fill="#38BDF8"/>
+    <ellipse cx="19" cy="21" rx="10" ry="8.5" transform="rotate(-16 19 21)" fill="url(#metal)"/>
+    <polygon points="11,20 18,22 23,56 15,57" fill="url(#metal)"/>
+    <line x1="17.5" y1="24" x2="22" y2="54" stroke="url(#cyanLed)" stroke-width="2.5" stroke-linecap="round"/>
+  </g>
+
+  <!-- Right Earbud (High Contrast Tray Silhouette) -->
+  <g>
+    <ellipse cx="38" cy="19" rx="6.5" ry="7.5" transform="rotate(-22 38 19)" fill="#38BDF8"/>
+    <ellipse cx="45" cy="21" rx="10" ry="8.5" transform="rotate(16 45 21)" fill="url(#metal)"/>
+    <polygon points="53,20 46,22 41,56 49,57" fill="url(#metal)"/>
+    <line x1="46.5" y1="24" x2="42" y2="54" stroke="url(#cyanLed)" stroke-width="2.5" stroke-linecap="round"/>
+  </g>
+</svg>

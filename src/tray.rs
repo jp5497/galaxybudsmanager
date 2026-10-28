@@ -5,6 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
+const TRAY_ICON_ARGB: &[u8] = include_bytes!("../assets/tray_icon_64.argb");
+
+fn custom_tray_pixmap() -> Vec<ksni::Icon> {
+    vec![ksni::Icon {
+        width: 64,
+        height: 64,
+        data: TRAY_ICON_ARGB.to_vec(),
+    }]
+}
+
 pub struct BudsTray {
     pub snapshot: Buds4ProState,
     pub cmd_tx: mpsc::UnboundedSender<UserCommand>,
@@ -17,7 +27,11 @@ impl ksni::Tray for BudsTray {
     }
 
     fn icon_name(&self) -> String {
-        "audio-headset".to_string()
+        String::new()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        custom_tray_pixmap()
     }
 
     fn title(&self) -> String {
@@ -51,8 +65,8 @@ impl ksni::Tray for BudsTray {
         };
 
         ksni::ToolTip {
-            icon_name: "audio-headset".to_string(),
-            icon_pixmap: Vec::new(),
+            icon_name: String::new(),
+            icon_pixmap: custom_tray_pixmap(),
             title: self.snapshot.device_name.clone(),
             description,
         }

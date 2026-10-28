@@ -2,7 +2,8 @@
 Name=Galaxy Buds4 Pro Manager
 Comment=Gerenciador em Rust para Samsung Galaxy Buds 4 Pro
 Exec=buds4pro gui
-Icon=audio-headset
+Icon=buds4pro
+StartupWMClass=buds4pro
 Terminal=false
 Type=Application
 Categories=AudioVideo;Audio;Settings;HardwareSettings;
