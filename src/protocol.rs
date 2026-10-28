@@ -510,10 +510,14 @@ impl Buds4ProState {
                     self.is_left_charging = (cs & (1 << 4)) != 0;
                     self.is_right_charging = (cs & (1 << 2)) != 0;
                     self.is_case_charging = (cs & (1 << 0)) != 0;
-                    if self.is_left_charging {
+                    if self.is_left_charging
+                        && !matches!(pl_l, PlacementState::ClosedCase | PlacementState::Disconnected)
+                    {
                         pl_l = PlacementState::Charging;
                     }
-                    if self.is_right_charging {
+                    if self.is_right_charging
+                        && !matches!(pl_r, PlacementState::ClosedCase | PlacementState::Disconnected)
+                    {
                         pl_r = PlacementState::Charging;
                     }
                 }
@@ -581,10 +585,14 @@ impl Buds4ProState {
                     self.is_left_charging = (cs & (1 << 4)) != 0;
                     self.is_right_charging = (cs & (1 << 2)) != 0;
                     self.is_case_charging = (cs & (1 << 0)) != 0;
-                    if self.is_left_charging {
+                    if self.is_left_charging
+                        && !matches!(pl_l, PlacementState::ClosedCase | PlacementState::Disconnected)
+                    {
                         pl_l = PlacementState::Charging;
                     }
-                    if self.is_right_charging {
+                    if self.is_right_charging
+                        && !matches!(pl_r, PlacementState::ClosedCase | PlacementState::Disconnected)
+                    {
                         pl_r = PlacementState::Charging;
                     }
                 }

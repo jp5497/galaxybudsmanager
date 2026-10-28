@@ -350,6 +350,7 @@ impl BudsGuiApp {
         charging: bool,
         placement: Option<PlacementState>,
         temp_c: Option<f32>,
+        case_sync_live: bool,
     ) {
         let is_active = pct > 0 && pct <= 100;
         let accent = if !is_active {
@@ -493,24 +494,45 @@ impl BudsGuiApp {
                 ui.add_space(2.0);
 
                 // Status Pill
-                let status_str = match placement {
-                    Some(pl) => pl.label_pt(),
+                let (status_str, pill_bg, pill_fg) = match placement {
+                    Some(pl) => {
+                        let bg = match pl {
+                            PlacementState::Wearing | PlacementState::Charging => {
+                                Color32::from_rgb(16, 48, 42)
+                            }
+                            PlacementState::InCase => Color32::from_rgb(20, 40, 66),
+                            _ => Color32::from_rgb(25, 31, 44),
+                        };
+                        let fg = match pl {
+                            PlacementState::Wearing | PlacementState::Charging => STATUS_GREEN,
+                            PlacementState::InCase => ACCENT_CYAN,
+                            _ => TEXT_SECONDARY,
+                        };
+                        (pl.label_pt(), bg, fg)
+                    }
                     None => {
-                        if is_active {
-                            "Estojo aberto"
+                        if charging {
+                            ("Carregando", Color32::from_rgb(16, 48, 42), STATUS_GREEN)
+                        } else if is_active && case_sync_live {
+                            (
+                                "Sincronizado (Aberto)",
+                                Color32::from_rgb(20, 40, 66),
+                                ACCENT_CYAN,
+                            )
+                        } else if is_active {
+                            (
+                                "Última leitura (Cache)",
+                                Color32::from_rgb(32, 36, 48),
+                                TEXT_SECONDARY,
+                            )
                         } else {
-                            "Estojo fechado"
+                            (
+                                "Sem leitura",
+                                Color32::from_rgb(25, 31, 44),
+                                TEXT_MUTED,
+                            )
                         }
                     }
-                };
-                let pill_bg = match placement {
-                    Some(PlacementState::Wearing) => Color32::from_rgb(16, 48, 42),
-                    Some(PlacementState::Charging) => Color32::from_rgb(18, 52, 38),
-                    _ => Color32::from_rgb(25, 31, 44),
-                };
-                let pill_fg = match placement {
-                    Some(PlacementState::Wearing) | Some(PlacementState::Charging) => STATUS_GREEN,
-                    _ => TEXT_SECONDARY,
                 };
 
                 egui::Frame::NONE
@@ -1457,6 +1479,14 @@ impl eframe::App for BudsGuiApp {
             ui.add_space(12.0);
 
             // --- 3 Hero Battery & Device Status Cards ---
+            let any_bud_in_open_case = matches!(
+                self.snapshot.placement_left,
+                PlacementState::InCase | PlacementState::Charging
+            ) || matches!(
+                self.snapshot.placement_right,
+                PlacementState::InCase | PlacementState::Charging
+            );
+
             ui.columns(3, |cols| {
                 Self::render_hero_device_card(
                     &mut cols[0],
@@ -1466,6 +1496,7 @@ impl eframe::App for BudsGuiApp {
                     self.snapshot.is_left_charging,
                     Some(self.snapshot.placement_left),
                     Some(self.snapshot.temp_left_c),
+                    false,
                 );
                 Self::render_hero_device_card(
                     &mut cols[1],
@@ -1475,15 +1506,17 @@ impl eframe::App for BudsGuiApp {
                     self.snapshot.is_right_charging,
                     Some(self.snapshot.placement_right),
                     Some(self.snapshot.temp_right_c),
+                    false,
                 );
                 Self::render_hero_device_card(
                     &mut cols[2],
                     "Estojo de Carga",
                     "CASE",
                     self.snapshot.battery_case,
-                    self.snapshot.is_case_charging,
+                    self.snapshot.is_case_charging && any_bud_in_open_case,
                     None,
                     None,
+                    any_bud_in_open_case,
                 );
             });
 

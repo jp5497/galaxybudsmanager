@@ -179,15 +179,34 @@ fn print_status(s: &Buds4ProState, as_json: bool) {
         if s.is_right_charging { "⚡" } else { "  " },
         s.placement_right.label_pt()
     );
-    let case_str = if s.battery_case <= 100 && s.battery_case > 0 {
-        format!("{:>3}%", s.battery_case)
+    let any_in_case = matches!(
+        s.placement_left,
+        protocol::PlacementState::InCase | protocol::PlacementState::Charging
+    ) || matches!(
+        s.placement_right,
+        protocol::PlacementState::InCase | protocol::PlacementState::Charging
+    );
+    let (case_str, case_note) = if s.battery_case <= 100 && s.battery_case > 0 {
+        (
+            format!("{:>3}%", s.battery_case),
+            if any_in_case {
+                "Sincronizado   "
+            } else {
+                "Última leitura "
+            },
+        )
     } else {
-        "N/D ".to_string()
+        ("N/D ".to_string(), "Estojo fechado ")
     };
     println!(
-        "│  🔋 Estojo     (Case): {} {}                           │",
+        "│  🔋 Estojo     (Case): {} {} ({}) │",
         case_str,
-        if s.is_case_charging { "⚡" } else { "  " }
+        if s.is_case_charging && any_in_case {
+            "⚡"
+        } else {
+            "  "
+        },
+        case_note
     );
     if s.temp_left_c > 0.0 || s.temp_right_c > 0.0 {
         println!(
