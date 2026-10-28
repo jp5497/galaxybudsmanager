@@ -47,6 +47,22 @@ fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - clamped).powi(3)
 }
 
+fn ease_out_quint(t: f32) -> f32 {
+    let clamped = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - clamped).powi(5)
+}
+
+fn ease_in_out_cubic(t: f32) -> f32 {
+    let c = t.clamp(0.0, 1.0);
+    if c < 0.5 {
+        4.0 * c * c * c
+    } else {
+        1.0 - (-2.0 * c + 2.0).powi(3) / 2.0
+    }
+}
+
+const TAB_TRANSITION_DURATION: f32 = 0.45;
+
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     Color32::from_rgba_unmultiplied(
@@ -64,6 +80,7 @@ pub struct BudsGuiApp {
     quit_flag: Arc<AtomicBool>,
     snapshot: Buds4ProState,
     active_tab: ActiveTab,
+    prev_tab: ActiveTab,
     local_bands: [i8; 9],
     bands_dirty: bool,
     last_sync: Instant,
@@ -77,6 +94,9 @@ pub struct BudsGuiApp {
     anim_eq_bands: [f32; 9],
     tab_transition_instant: Instant,
     tab_slide_dir: f32,
+    anim_pill_left: f32,
+    anim_pill_right: f32,
+    pill_initialized: bool,
 }
 
 impl BudsGuiApp {
@@ -101,6 +121,7 @@ impl BudsGuiApp {
             quit_flag,
             snapshot: snap,
             active_tab: ActiveTab::SoundControl,
+            prev_tab: ActiveTab::SoundControl,
             local_bands,
             bands_dirty: false,
             last_sync: now,
@@ -113,6 +134,9 @@ impl BudsGuiApp {
             anim_eq_bands: [0.0; 9],
             tab_transition_instant: now,
             tab_slide_dir: 1.0,
+            anim_pill_left: 0.0,
+            anim_pill_right: 0.0,
+            pill_initialized: false,
         }
     }
 
@@ -141,7 +165,7 @@ impl BudsGuiApp {
         style.spacing.item_spacing = Vec2::new(10.0, 10.0);
         style.spacing.window_margin = Margin::same(18);
         style.spacing.button_padding = Vec2::new(14.0, 8.0);
-        style.animation_time = 0.22;
+        style.animation_time = 0.30;
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BG_BASE;
@@ -173,8 +197,17 @@ impl BudsGuiApp {
             } else {
                 -1.0
             };
+            self.prev_tab = self.active_tab;
             self.active_tab = next_tab;
             self.tab_transition_instant = Instant::now();
+        }
+    }
+
+    fn render_tab_by_id(&mut self, ui: &mut Ui, tab: ActiveTab) {
+        match tab {
+            ActiveTab::SoundControl => self.render_sound_control_tab(ui),
+            ActiveTab::Equalizer => self.render_equalizer_tab(ui),
+            ActiveTab::TouchAndSystem => self.render_touch_and_system_tab(ui),
         }
     }
 
@@ -248,7 +281,8 @@ impl BudsGuiApp {
         }
 
         if since_launch < 0.75
-            || now.duration_since(self.tab_transition_instant).as_secs_f32() < 0.30
+            || now.duration_since(self.tab_transition_instant).as_secs_f32()
+                < TAB_TRANSITION_DURATION + 0.05
         {
             animating = true;
         }
@@ -1467,9 +1501,10 @@ impl eframe::App for BudsGuiApp {
             self.last_sync = Instant::now();
         }
 
+        let dt = ctx.input(|i| i.stable_dt.clamp(0.001, 0.05));
         let is_animating = self.step_animations();
         if is_animating {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
@@ -1478,8 +1513,13 @@ impl eframe::App for BudsGuiApp {
         let launch_ease = ease_out_cubic(since_launch / 0.55);
 
         let tab_elapsed = self.tab_transition_instant.elapsed().as_secs_f32();
-        let tab_ease = ease_out_cubic(tab_elapsed / 0.26);
-        let tab_offset_x = self.tab_slide_dir * 26.0 * (1.0 - tab_ease);
+        let tab_raw_t = (tab_elapsed / TAB_TRANSITION_DURATION).clamp(0.0, 1.0);
+        let tab_pos_ease = ease_out_quint(tab_raw_t);
+        let tab_in_alpha = ease_in_out_cubic((tab_raw_t * 1.15).clamp(0.0, 1.0));
+        let tab_out_alpha = (1.0 - ease_out_cubic((tab_raw_t * 1.45).clamp(0.0, 1.0))).max(0.0);
+        let slide_distance = 16.0;
+        let in_offset_x = self.tab_slide_dir * slide_distance * (1.0 - tab_pos_ease);
+        let out_offset_x = -self.tab_slide_dir * (slide_distance * 0.75) * tab_pos_ease;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Smooth entrance vertical offset and fade-in on startup
@@ -1591,9 +1631,10 @@ impl eframe::App for BudsGuiApp {
 
                             for (tab, label) in tabs {
                                 let active = self.active_tab == tab;
-                                let anim_col = ui
+                                let raw_col = ui
                                     .ctx()
                                     .animate_bool(Id::new(("tab_txt_col", tab.index())), active);
+                                let anim_col = ease_in_out_cubic(raw_col);
                                 let btn = egui::Button::new(
                                     RichText::new(label)
                                         .size(12.5)
@@ -1614,27 +1655,41 @@ impl eframe::App for BudsGuiApp {
                             }
 
                             if let Some(target_r) = active_rect {
-                                let anim_left = ui.ctx().animate_value_with_time(
-                                    Id::new("nav_pill_left"),
-                                    target_r.left(),
-                                    0.20,
-                                );
-                                let anim_right = ui.ctx().animate_value_with_time(
-                                    Id::new("nav_pill_right"),
-                                    target_r.right(),
-                                    0.20,
-                                );
+                                if !self.pill_initialized {
+                                    self.anim_pill_left = target_r.left();
+                                    self.anim_pill_right = target_r.right();
+                                    self.pill_initialized = true;
+                                } else {
+                                    let diff_l = target_r.left() - self.anim_pill_left;
+                                    let diff_r = target_r.right() - self.anim_pill_right;
+                                    // Organic liquid stretch: leading edge moves slightly faster than trailing edge
+                                    let moving_right = diff_l > 0.0;
+                                    let speed_l = if moving_right { 11.5 } else { 15.5 };
+                                    let speed_r = if moving_right { 15.5 } else { 11.5 };
+
+                                    if diff_l.abs() > 0.2 || diff_r.abs() > 0.2 {
+                                        self.anim_pill_left += diff_l * (speed_l * dt).min(1.0);
+                                        self.anim_pill_right += diff_r * (speed_r * dt).min(1.0);
+                                        ui.ctx().request_repaint();
+                                    } else {
+                                        self.anim_pill_left = target_r.left();
+                                        self.anim_pill_right = target_r.right();
+                                    }
+                                }
+
                                 let pill_rect = Rect::from_min_max(
-                                    Pos2::new(anim_left, target_r.top()),
-                                    Pos2::new(anim_right, target_r.bottom()),
+                                    Pos2::new(self.anim_pill_left, target_r.top()),
+                                    Pos2::new(self.anim_pill_right, target_r.bottom()),
                                 );
                                 ui.painter().set(
                                     pill_shape_idx,
-                                    egui::Shape::rect_filled(
+                                    egui::Shape::Rect(egui::epaint::RectShape::new(
                                         pill_rect,
                                         CornerRadius::same(8),
                                         ACCENT_BLUE,
-                                    ),
+                                        Stroke::new(1.0_f32, ACCENT_CYAN.gamma_multiply(0.45)),
+                                        egui::StrokeKind::Inside,
+                                    )),
                                 );
                             }
 
@@ -1694,17 +1749,32 @@ impl eframe::App for BudsGuiApp {
 
             ui.add_space(12.0);
 
-            // --- Animated Active Tab Content Area (Slide + Cross-Fade) ---
+            // --- Dual-Layer Animated Tab Content Area (Simultaneous Outgoing + Incoming Cross-Fade & Quintic Glide) ---
             let avail = ui.available_rect_before_wrap();
-            let shifted_rect = avail.translate(Vec2::new(tab_offset_x, 0.0));
-            ui.scope_builder(UiBuilder::new().max_rect(shifted_rect), |ui| {
-                ui.set_opacity(launch_ease * tab_ease);
+            let prev = self.prev_tab;
+            let curr = self.active_tab;
+
+            if tab_raw_t < 1.0 && prev != curr && tab_out_alpha > 0.01 {
+                let out_rect = avail.translate(Vec2::new(out_offset_x, 0.0));
+                ui.scope_builder(UiBuilder::new().max_rect(out_rect).disabled(), |ui| {
+                    ui.set_opacity(launch_ease * tab_out_alpha);
+                    egui::ScrollArea::vertical()
+                        .id_salt(("tab_scroll", prev.index()))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.render_tab_by_id(ui, prev);
+                        });
+                });
+            }
+
+            let in_rect = avail.translate(Vec2::new(in_offset_x, 0.0));
+            ui.scope_builder(UiBuilder::new().max_rect(in_rect), |ui| {
+                ui.set_opacity(launch_ease * tab_in_alpha);
                 egui::ScrollArea::vertical()
+                    .id_salt(("tab_scroll", curr.index()))
                     .auto_shrink([false, false])
-                    .show(ui, |ui| match self.active_tab {
-                        ActiveTab::SoundControl => self.render_sound_control_tab(ui),
-                        ActiveTab::Equalizer => self.render_equalizer_tab(ui),
-                        ActiveTab::TouchAndSystem => self.render_touch_and_system_tab(ui),
+                    .show(ui, |ui| {
+                        self.render_tab_by_id(ui, curr);
                     });
             });
         });
