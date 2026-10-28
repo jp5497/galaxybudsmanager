@@ -2,7 +2,7 @@ use crate::ipc::UserCommand;
 use crate::protocol::{Buds4ProState, EqualizerPreset, NoiseControlMode, PlacementState};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Id, Layout, Margin,
-    Pos2, Rect, Response, RichText, Sense, Stroke, Ui, Vec2,
+    Pos2, Rect, Response, RichText, Sense, Stroke, Ui, UiBuilder, Vec2,
 };
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,9 +31,30 @@ const EQ_BAND_LABELS: [&str; 9] = [
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
-    SoundControl,
-    Equalizer,
-    TouchAndSystem,
+    SoundControl = 0,
+    Equalizer = 1,
+    TouchAndSystem = 2,
+}
+
+impl ActiveTab {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    let clamped = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - clamped).powi(3)
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    Color32::from_rgba_unmultiplied(
+        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t) as u8,
+        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t) as u8,
+        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t) as u8,
+        (a.a() as f32 + (b.a() as f32 - a.a() as f32) * t) as u8,
+    )
 }
 
 pub struct BudsGuiApp {
@@ -46,6 +67,16 @@ pub struct BudsGuiApp {
     local_bands: [i8; 9],
     bands_dirty: bool,
     last_sync: Instant,
+
+    // Animation state
+    launch_instant: Instant,
+    last_frame_instant: Instant,
+    anim_batt_left: f32,
+    anim_batt_right: f32,
+    anim_batt_case: f32,
+    anim_eq_bands: [f32; 9],
+    tab_transition_instant: Instant,
+    tab_slide_dir: f32,
 }
 
 impl BudsGuiApp {
@@ -61,6 +92,7 @@ impl BudsGuiApp {
 
         let snap = state.blocking_read().clone();
         let local_bands = snap.custom_eq_bands;
+        let now = Instant::now();
 
         Self {
             state,
@@ -71,7 +103,16 @@ impl BudsGuiApp {
             active_tab: ActiveTab::SoundControl,
             local_bands,
             bands_dirty: false,
-            last_sync: Instant::now(),
+            last_sync: now,
+            launch_instant: now,
+            last_frame_instant: now,
+            // Start battery gauges at 0.0 so they sweep up smoothly on launch!
+            anim_batt_left: 0.0,
+            anim_batt_right: 0.0,
+            anim_batt_case: 0.0,
+            anim_eq_bands: [0.0; 9],
+            tab_transition_instant: now,
+            tab_slide_dir: 1.0,
         }
     }
 
@@ -100,6 +141,7 @@ impl BudsGuiApp {
         style.spacing.item_spacing = Vec2::new(10.0, 10.0);
         style.spacing.window_margin = Margin::same(18);
         style.spacing.button_padding = Vec2::new(14.0, 8.0);
+        style.animation_time = 0.22;
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BG_BASE;
@@ -124,6 +166,96 @@ impl BudsGuiApp {
         let _ = self.cmd_tx.send(cmd);
     }
 
+    fn switch_tab(&mut self, next_tab: ActiveTab) {
+        if self.active_tab != next_tab {
+            self.tab_slide_dir = if next_tab.index() > self.active_tab.index() {
+                1.0
+            } else {
+                -1.0
+            };
+            self.active_tab = next_tab;
+            self.tab_transition_instant = Instant::now();
+        }
+    }
+
+    /// Updates continuous animations (battery sweep-up, EQ curve morphing, tab transitions)
+    /// and returns `true` if another 60fps frame is needed immediately.
+    fn step_animations(&mut self) -> bool {
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.last_frame_instant)
+            .as_secs_f32()
+            .clamp(0.001, 0.05);
+        self.last_frame_instant = now;
+
+        let since_launch = now.duration_since(self.launch_instant).as_secs_f32();
+        let mut animating = false;
+
+        // Staggered battery count-up animation (L starts at 0.06s, R at 0.16s, Case at 0.26s)
+        let target_l = if self.snapshot.battery_left <= 100 && since_launch > 0.06 {
+            self.snapshot.battery_left as f32
+        } else {
+            0.0
+        };
+        let target_r = if self.snapshot.battery_right <= 100 && since_launch > 0.16 {
+            self.snapshot.battery_right as f32
+        } else {
+            0.0
+        };
+        let target_c = if self.snapshot.battery_case <= 100 && since_launch > 0.26 {
+            self.snapshot.battery_case as f32
+        } else {
+            0.0
+        };
+
+        let speed = 5.2_f32;
+        for (curr, target) in [
+            (&mut self.anim_batt_left, target_l),
+            (&mut self.anim_batt_right, target_r),
+            (&mut self.anim_batt_case, target_c),
+        ] {
+            let diff = target - *curr;
+            if diff.abs() > 0.15 {
+                // Smooth exponential approach + minimum velocity so it reaches exact integer cleanly
+                let step = diff * (speed * dt).min(1.0) + diff.signum() * 8.0 * dt;
+                if step.abs() >= diff.abs() {
+                    *curr = target;
+                } else {
+                    *curr += step;
+                }
+                animating = true;
+            } else {
+                *curr = target;
+            }
+        }
+
+        // Smooth Equalizer 9-Band curve morphing
+        let is_custom = self.snapshot.equalizer == EqualizerPreset::Custom;
+        let target_bands = if is_custom || self.bands_dirty {
+            self.local_bands.map(|v| v as f32)
+        } else {
+            Self::preset_curve_preview(self.snapshot.equalizer, &self.local_bands)
+        };
+
+        for i in 0..9 {
+            let diff = target_bands[i] - self.anim_eq_bands[i];
+            if diff.abs() > 0.05 {
+                self.anim_eq_bands[i] += diff * (12.0 * dt).min(1.0);
+                animating = true;
+            } else {
+                self.anim_eq_bands[i] = target_bands[i];
+            }
+        }
+
+        if since_launch < 0.75
+            || now.duration_since(self.tab_transition_instant).as_secs_f32() < 0.30
+        {
+            animating = true;
+        }
+
+        animating
+    }
+
     // --- Custom Painted Widgets ---
 
     fn card_frame() -> egui::Frame {
@@ -144,11 +276,7 @@ impl BudsGuiApp {
         }
 
         let how_on = ui.ctx().animate_bool(Id::new(id_str), *value);
-        let bg_color = Color32::from_rgb(
-            (36.0 + (59.0 - 36.0) * how_on) as u8,
-            (45.0 + (130.0 - 45.0) * how_on) as u8,
-            (62.0 + (246.0 - 62.0) * how_on) as u8,
-        );
+        let bg_color = lerp_color(Color32::from_rgb(36, 45, 62), ACCENT_BLUE, how_on);
         let border_color = if *value || response.hovered() {
             ACCENT_BLUE
         } else {
@@ -182,21 +310,14 @@ impl BudsGuiApp {
         mut enabled: bool,
     ) -> bool {
         let mut changed = false;
+        let how_on = ui.ctx().animate_bool(Id::new((id_str, "card_bg")), enabled);
+        let fill_color = lerp_color(BG_CARD, Color32::from_rgb(20, 29, 46), how_on);
+        let stroke_color = lerp_color(BORDER_SUBTLE, Color32::from_rgb(45, 85, 160), how_on);
+
         let frame = egui::Frame::NONE
-            .fill(if enabled {
-                Color32::from_rgb(20, 29, 46)
-            } else {
-                BG_CARD
-            })
+            .fill(fill_color)
             .corner_radius(CornerRadius::same(14))
-            .stroke(Stroke::new(
-                1.0_f32,
-                if enabled {
-                    Color32::from_rgb(45, 85, 160)
-                } else {
-                    BORDER_SUBTLE
-                },
-            ))
+            .stroke(Stroke::new(1.0_f32, stroke_color))
             .inner_margin(Margin::symmetric(16, 13));
 
         frame.show(ui, |ui| {
@@ -204,12 +325,8 @@ impl BudsGuiApp {
             ui.horizontal(|ui| {
                 // Vector Icon Badge
                 let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(38.0, 38.0), Sense::hover());
-                let badge_bg = if enabled {
-                    ACCENT_TINT
-                } else {
-                    Color32::from_rgb(26, 33, 46)
-                };
-                let fg = if enabled { ACCENT_CYAN } else { TEXT_SECONDARY };
+                let badge_bg = lerp_color(Color32::from_rgb(26, 33, 46), ACCENT_TINT, how_on);
+                let fg = lerp_color(TEXT_SECONDARY, ACCENT_CYAN, how_on);
                 ui.painter()
                     .circle_filled(icon_rect.center(), 19.0, badge_bg);
                 Self::paint_vector_icon(ui.painter(), icon_rect.center(), icon_kind, fg);
@@ -244,20 +361,23 @@ impl BudsGuiApp {
                 );
             }
             "anc" => {
-                // Sound wave shield / active cancellation waves
                 painter.circle_stroke(c, 8.5, stroke);
-                painter.line_segment([Pos2::new(c.x - 3.5, c.y - 3.5), Pos2::new(c.x - 3.5, c.y + 3.5)], stroke);
+                painter.line_segment(
+                    [Pos2::new(c.x - 3.5, c.y - 3.5), Pos2::new(c.x - 3.5, c.y + 3.5)],
+                    stroke,
+                );
                 painter.line_segment([Pos2::new(c.x, c.y - 5.5), Pos2::new(c.x, c.y + 5.5)], stroke);
-                painter.line_segment([Pos2::new(c.x + 3.5, c.y - 3.5), Pos2::new(c.x + 3.5, c.y + 3.5)], stroke);
+                painter.line_segment(
+                    [Pos2::new(c.x + 3.5, c.y - 3.5), Pos2::new(c.x + 3.5, c.y + 3.5)],
+                    stroke,
+                );
             }
             "ambient" => {
-                // Ear / outer sound waves
                 painter.circle_filled(Pos2::new(c.x - 3.0, c.y), 2.5, color);
                 Self::paint_arc(painter, Pos2::new(c.x - 3.0, c.y), 6.0, -0.8, 0.8, stroke);
                 Self::paint_arc(painter, Pos2::new(c.x - 3.0, c.y), 10.0, -0.9, 0.9, stroke);
             }
             "adaptive" => {
-                // Four-point star / AI adaptive
                 painter.line_segment([Pos2::new(c.x, c.y - 8.5), Pos2::new(c.x, c.y + 8.5)], stroke);
                 painter.line_segment([Pos2::new(c.x - 8.5, c.y), Pos2::new(c.x + 8.5, c.y)], stroke);
                 painter.line_segment(
@@ -270,7 +390,6 @@ impl BudsGuiApp {
                 );
             }
             "voice" => {
-                // Voice waveform bars
                 for (dx, h) in [(-6.0, 3.5), (-2.0, 7.5), (2.0, 5.5), (6.0, 3.0)] {
                     painter.line_segment(
                         [Pos2::new(c.x + dx, c.y - h), Pos2::new(c.x + dx, c.y + h)],
@@ -279,32 +398,26 @@ impl BudsGuiApp {
                 }
             }
             "game" => {
-                // Lightning / low latency bolt
                 let pts = [
                     Pos2::new(c.x + 1.5, c.y - 8.5),
                     Pos2::new(c.x - 5.0, c.y + 1.0),
                     Pos2::new(c.x + 0.5, c.y + 1.0),
                     Pos2::new(c.x - 1.5, c.y + 8.5),
-                    Pos2::new(c.x + 5.0, c.y - 1.0),
-                    Pos2::new(c.x - 0.5, c.y - 1.0),
                 ];
                 painter.line_segment([pts[0], pts[1]], stroke);
                 painter.line_segment([pts[1], pts[2]], stroke);
                 painter.line_segment([pts[2], pts[3]], stroke);
             }
             "link" => {
-                // Seamless connection nodes
                 painter.circle_stroke(Pos2::new(c.x - 4.0, c.y), 4.5, stroke);
                 painter.circle_stroke(Pos2::new(c.x + 4.0, c.y), 4.5, stroke);
             }
             "touch" => {
-                // Touch ripple concentric rings
                 painter.circle_filled(c, 2.5, color);
                 painter.circle_stroke(c, 6.0, stroke);
                 Self::paint_arc(painter, c, 9.5, -2.2, -0.9, stroke);
             }
             "call" => {
-                // Microphone capsule
                 let r = Rect::from_center_size(Pos2::new(c.x, c.y - 2.0), Vec2::new(6.0, 10.0));
                 painter.rect_stroke(r, CornerRadius::same(3), stroke, egui::StrokeKind::Inside);
                 painter.line_segment([Pos2::new(c.x, c.y + 5.0), Pos2::new(c.x, c.y + 8.5)], stroke);
@@ -327,7 +440,7 @@ impl BudsGuiApp {
         end_angle: f32,
         stroke: Stroke,
     ) {
-        let steps = 28;
+        let steps = 32;
         let mut pts = Vec::with_capacity(steps + 1);
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
@@ -340,28 +453,40 @@ impl BudsGuiApp {
         painter.add(egui::Shape::line(pts, stroke));
     }
 
-    /// Renders a modern Hero Card for Left Bud, Right Bud, or Case with a circular radial battery gauge
-    /// and a vector silhouette of the Buds 4 Pro blade earbud / charging case.
+    /// Dynamic color interpolation as the battery gauge sweeps from 0% up to the target %
+    fn animated_battery_color(anim_pct: f32, is_active: bool) -> Color32 {
+        if !is_active {
+            return Color32::from_rgb(64, 74, 94);
+        }
+        if anim_pct < 25.0 {
+            lerp_color(STATUS_RED, STATUS_AMBER, (anim_pct / 25.0).clamp(0.0, 1.0))
+        } else if anim_pct < 55.0 {
+            lerp_color(
+                STATUS_AMBER,
+                STATUS_GREEN,
+                ((anim_pct - 25.0) / 30.0).clamp(0.0, 1.0),
+            )
+        } else {
+            STATUS_GREEN
+        }
+    }
+
+    /// Renders a modern Hero Card for Left Bud, Right Bud, or Case with an animated circular radial battery gauge
+    #[allow(clippy::too_many_arguments)]
     fn render_hero_device_card(
         ui: &mut Ui,
         title: &str,
         side_badge: &str,
-        pct: u8,
+        raw_pct: u8,
+        anim_pct: f32,
         charging: bool,
         placement: Option<PlacementState>,
         temp_c: Option<f32>,
         case_sync_live: bool,
     ) {
-        let is_active = pct > 0 && pct <= 100;
-        let accent = if !is_active {
-            Color32::from_rgb(64, 74, 94)
-        } else if pct > 50 {
-            STATUS_GREEN
-        } else if pct > 20 {
-            STATUS_AMBER
-        } else {
-            STATUS_RED
-        };
+        let is_active = raw_pct > 0 && raw_pct <= 100;
+        let display_pct = anim_pct.round().clamp(0.0, 100.0) as u8;
+        let accent = Self::animated_battery_color(anim_pct, is_active);
 
         let frame = egui::Frame::NONE
             .fill(BG_CARD)
@@ -420,9 +545,9 @@ impl BudsGuiApp {
                     Stroke::new(5.5_f32, Color32::from_rgb(30, 38, 54)),
                 );
 
-                // Progress arc
-                if is_active {
-                    let frac = (pct as f32 / 100.0).clamp(0.0, 1.0);
+                // Animated Progress Arc
+                if is_active && anim_pct > 0.2 {
+                    let frac = (anim_pct / 100.0).clamp(0.0, 1.0);
                     Self::paint_arc(
                         ui.painter(),
                         center,
@@ -431,12 +556,23 @@ impl BudsGuiApp {
                         start_angle + sweep * frac,
                         Stroke::new(5.5_f32, accent),
                     );
+
+                    // Subtle glowing tip dot at the end of the animated arc
+                    let end_angle = start_angle + sweep * frac;
+                    let tip_pos = Pos2::new(
+                        center.x + radius * end_angle.cos(),
+                        center.y + radius * end_angle.sin(),
+                    );
+                    ui.painter()
+                        .circle_filled(tip_pos, 3.2, Color32::WHITE);
                 }
 
                 // Inner vector illustration (Earbud with blade stem or Charging Case)
                 if side_badge == "CASE" {
-                    let case_rect =
-                        Rect::from_center_size(Pos2::new(center.x, center.y + 1.0), Vec2::new(30.0, 22.0));
+                    let case_rect = Rect::from_center_size(
+                        Pos2::new(center.x, center.y + 1.0),
+                        Vec2::new(30.0, 22.0),
+                    );
                     ui.painter().rect(
                         case_rect,
                         CornerRadius::same(7),
@@ -444,7 +580,6 @@ impl BudsGuiApp {
                         Stroke::new(1.5_f32, TEXT_SECONDARY),
                         egui::StrokeKind::Inside,
                     );
-                    // Lid split line
                     ui.painter().line_segment(
                         [
                             Pos2::new(case_rect.left() + 2.0, center.y - 1.0),
@@ -452,24 +587,15 @@ impl BudsGuiApp {
                         ],
                         Stroke::new(1.0_f32, TEXT_MUTED),
                     );
-                    // Case status LED dot
                     ui.painter()
                         .circle_filled(Pos2::new(center.x, center.y + 4.5), 2.0, accent);
                 } else {
-                    // Buds 4 Pro silhouette: acoustic head + angled blade stem
                     let dir = if side_badge == "L" { -1.0 } else { 1.0 };
                     let head_pos = Pos2::new(center.x + dir * 3.5, center.y - 6.5);
-                    ui.painter().circle_filled(
-                        head_pos,
-                        7.5,
-                        Color32::from_rgb(45, 56, 78),
-                    );
-                    ui.painter().circle_stroke(
-                        head_pos,
-                        7.5,
-                        Stroke::new(1.5_f32, TEXT_SECONDARY),
-                    );
-                    // Blade stem
+                    ui.painter()
+                        .circle_filled(head_pos, 7.5, Color32::from_rgb(45, 56, 78));
+                    ui.painter()
+                        .circle_stroke(head_pos, 7.5, Stroke::new(1.5_f32, TEXT_SECONDARY));
                     let stem_top = Pos2::new(center.x - dir * 2.0, center.y - 4.0);
                     let stem_bot = Pos2::new(center.x - dir * 5.0, center.y + 12.0);
                     ui.painter().line_segment(
@@ -478,9 +604,9 @@ impl BudsGuiApp {
                     );
                 }
 
-                // Percentage readout
+                // Animated Percentage Readout
                 let pct_text = if is_active {
-                    format!("{pct}%")
+                    format!("{display_pct}%")
                 } else {
                     "--%".to_string()
                 };
@@ -566,12 +692,17 @@ impl BudsGuiApp {
             for step in 0..=4u8 {
                 let is_lit = step <= current;
                 let is_exact = step == current;
+                let anim_lit = cols[step as usize]
+                    .ctx()
+                    .animate_bool(Id::new((label, step)), is_lit);
                 let bg = if is_exact {
                     ACCENT_BLUE
-                } else if is_lit {
-                    Color32::from_rgb(38, 78, 155)
                 } else {
-                    Color32::from_rgb(28, 35, 48)
+                    lerp_color(
+                        Color32::from_rgb(28, 35, 48),
+                        Color32::from_rgb(38, 78, 155),
+                        anim_lit,
+                    )
                 };
                 let border = if is_exact {
                     ACCENT_CYAN
@@ -606,7 +737,6 @@ impl BudsGuiApp {
     // --- Tab 1: Controle de Som ---
 
     fn render_sound_control_tab(&mut self, ui: &mut Ui) {
-        // Noise Control Section Card
         Self::card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -637,17 +767,16 @@ impl BudsGuiApp {
             ui.columns(4, |cols| {
                 for (idx, (mode, icon_kind, title, desc)) in modes.iter().enumerate() {
                     let selected = self.snapshot.noise_control == *mode;
-                    let fill = if selected { ACCENT_TINT } else { BG_SUBTLE };
-                    let border = if selected {
-                        Stroke::new(1.5_f32, ACCENT_BLUE)
-                    } else {
-                        Stroke::new(1.0_f32, BORDER_SUBTLE)
-                    };
+                    let anim_sel = cols[idx]
+                        .ctx()
+                        .animate_bool(Id::new(("nc_mode_anim", idx)), selected);
+                    let fill = lerp_color(BG_SUBTLE, ACCENT_TINT, anim_sel);
+                    let border_col = lerp_color(BORDER_SUBTLE, ACCENT_BLUE, anim_sel);
 
                     let frame = egui::Frame::NONE
                         .fill(fill)
                         .corner_radius(CornerRadius::same(12))
-                        .stroke(border)
+                        .stroke(Stroke::new(1.0 + 0.6 * anim_sel, border_col))
                         .inner_margin(Margin::symmetric(10, 12));
 
                     let resp = frame
@@ -656,42 +785,30 @@ impl BudsGuiApp {
                             ui.vertical_centered(|ui| {
                                 let (icon_rect, _) =
                                     ui.allocate_exact_size(Vec2::new(34.0, 34.0), Sense::hover());
-                                ui.painter().circle_filled(
-                                    icon_rect.center(),
-                                    17.0,
-                                    if selected {
-                                        ACCENT_BLUE
-                                    } else {
-                                        Color32::from_rgb(26, 33, 46)
-                                    },
+                                let circle_col = lerp_color(
+                                    Color32::from_rgb(26, 33, 46),
+                                    ACCENT_BLUE,
+                                    anim_sel,
                                 );
+                                ui.painter()
+                                    .circle_filled(icon_rect.center(), 17.0, circle_col);
                                 Self::paint_vector_icon(
                                     ui.painter(),
                                     icon_rect.center(),
                                     icon_kind,
-                                    if selected {
-                                        Color32::WHITE
-                                    } else {
-                                        TEXT_SECONDARY
-                                    },
+                                    lerp_color(TEXT_SECONDARY, Color32::WHITE, anim_sel),
                                 );
                                 ui.add_space(6.0);
                                 ui.label(
                                     RichText::new(*title)
                                         .size(13.5)
                                         .strong()
-                                        .color(if selected {
-                                            Color32::WHITE
-                                        } else {
-                                            TEXT_PRIMARY
-                                        }),
+                                        .color(lerp_color(TEXT_PRIMARY, Color32::WHITE, anim_sel)),
                                 );
                                 ui.label(
-                                    RichText::new(*desc).size(11.0).color(if selected {
-                                        ACCENT_CYAN
-                                    } else {
-                                        TEXT_MUTED
-                                    }),
+                                    RichText::new(*desc)
+                                        .size(11.0)
+                                        .color(lerp_color(TEXT_MUTED, ACCENT_CYAN, anim_sel)),
                                 );
                             });
                         })
@@ -704,7 +821,6 @@ impl BudsGuiApp {
                 }
             });
 
-            // Contextual Step Bar for Ambient or ANC
             if self.snapshot.noise_control == NoiseControlMode::Ambient {
                 self.render_step_bar(
                     ui,
@@ -724,7 +840,6 @@ impl BudsGuiApp {
 
         ui.add_space(10.0);
 
-        // Voice Detect Card with inline Duration Selector
         if Self::draw_feature_toggle_card(
             ui,
             "toggle_voice_detect",
@@ -771,7 +886,6 @@ impl BudsGuiApp {
 
         ui.add_space(6.0);
 
-        // 2-Column Bento Grid for Quick Toggles
         ui.columns(2, |cols| {
             if Self::draw_feature_toggle_card(
                 &mut cols[0],
@@ -847,20 +961,23 @@ impl BudsGuiApp {
             ui.horizontal_wrapped(|ui| {
                 for &preset in EqualizerPreset::all_presets() {
                     let active = self.snapshot.equalizer == preset;
+                    let anim_act = ui
+                        .ctx()
+                        .animate_bool(Id::new(("eq_preset_btn", preset as u8)), active);
                     let btn = egui::Button::new(
                         RichText::new(preset.label_pt())
                             .size(13.0)
                             .strong()
-                            .color(if active { Color32::WHITE } else { TEXT_SECONDARY }),
+                            .color(lerp_color(TEXT_SECONDARY, Color32::WHITE, anim_act)),
                     )
-                    .fill(if active {
-                        ACCENT_BLUE
-                    } else {
-                        Color32::from_rgb(26, 33, 46)
-                    })
+                    .fill(lerp_color(
+                        Color32::from_rgb(26, 33, 46),
+                        ACCENT_BLUE,
+                        anim_act,
+                    ))
                     .stroke(Stroke::new(
                         1.0_f32,
-                        if active { ACCENT_CYAN } else { BORDER_SUBTLE },
+                        lerp_color(BORDER_SUBTLE, ACCENT_CYAN, anim_act),
                     ))
                     .corner_radius(CornerRadius::same(10));
 
@@ -874,7 +991,6 @@ impl BudsGuiApp {
 
         ui.add_space(10.0);
 
-        // Graphic 9-Band Equalizer Studio Card
         Self::card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let is_custom = self.snapshot.equalizer == EqualizerPreset::Custom;
@@ -932,7 +1048,6 @@ impl BudsGuiApp {
 
             ui.add_space(12.0);
 
-            // Interactive Custom Painted 9-Band Equalizer Graph + Faders
             let avail_w = ui.available_width();
             let graph_h = 190.0;
             let (rect, _) = ui.allocate_exact_size(Vec2::new(avail_w, graph_h), Sense::hover());
@@ -945,7 +1060,6 @@ impl BudsGuiApp {
                 Pos2::new(rect.right() - 16.0, rect.bottom() - pad_bot),
             );
 
-            // Background Grid Lines (+10, 0, -10 dB)
             for (db_label, frac) in [("+10", 0.0_f32), ("0 dB", 0.5_f32), ("-10", 1.0_f32)] {
                 let y = egui::lerp(plot_rect.top()..=plot_rect.bottom(), frac);
                 ui.painter().line_segment(
@@ -968,28 +1082,19 @@ impl BudsGuiApp {
                 );
             }
 
-            let values = if is_custom || self.bands_dirty {
-                self.local_bands.map(|v| v as f32)
-            } else {
-                Self::preset_curve_preview(self.snapshot.equalizer, &self.local_bands)
-            };
+            let values = self.anim_eq_bands;
 
             let mut band_points = [Pos2::ZERO; 9];
             for i in 0..9 {
-                let x = egui::lerp(
-                    plot_rect.left()..=plot_rect.right(),
-                    i as f32 / 8.0,
-                );
+                let x = egui::lerp(plot_rect.left()..=plot_rect.right(), i as f32 / 8.0);
                 let norm = (10.0 - values[i].clamp(-10.0, 10.0)) / 20.0;
                 let y = egui::lerp(plot_rect.top()..=plot_rect.bottom(), norm);
                 band_points[i] = Pos2::new(x, y);
 
-                // Vertical fader track
                 ui.painter().line_segment(
                     [Pos2::new(x, plot_rect.top()), Pos2::new(x, plot_rect.bottom())],
                     Stroke::new(3.0_f32, Color32::from_rgb(28, 36, 52)),
                 );
-                // Active track from center (0 dB) to thumb
                 let zero_y = plot_rect.center().y;
                 ui.painter().line_segment(
                     [Pos2::new(x, zero_y), Pos2::new(x, y)],
@@ -997,29 +1102,30 @@ impl BudsGuiApp {
                 );
             }
 
-            // Connect the 9 points with a smooth glowing line
             ui.painter().add(egui::Shape::line(
                 band_points.to_vec(),
                 Stroke::new(2.5_f32, ACCENT_CYAN),
             ));
 
-            // Interactive Drag Handles for each of the 9 bands
             for i in 0..9 {
                 let pt = band_points[i];
                 let hit_rect = Rect::from_center_size(
                     Pos2::new(pt.x, plot_rect.center().y),
                     Vec2::new(32.0, plot_rect.height() + 16.0),
                 );
-                let band_resp = ui.interact(hit_rect, Id::new(("eq_band_drag", i)), Sense::click_and_drag());
+                let band_resp =
+                    ui.interact(hit_rect, Id::new(("eq_band_drag", i)), Sense::click_and_drag());
                 if band_resp.dragged() || band_resp.clicked() {
                     if let Some(mouse_pos) = band_resp.interact_pointer_pos() {
                         let clamped_y = mouse_pos.y.clamp(plot_rect.top(), plot_rect.bottom());
                         let norm = (clamped_y - plot_rect.top()) / plot_rect.height();
                         let db = (10.0 - norm * 20.0).round().clamp(-10.0, 10.0) as i8;
                         if !is_custom && !self.bands_dirty {
-                            self.local_bands =
-                                Self::preset_curve_preview(self.snapshot.equalizer, &self.local_bands)
-                                    .map(|v| v as i8);
+                            self.local_bands = Self::preset_curve_preview(
+                                self.snapshot.equalizer,
+                                &self.local_bands,
+                            )
+                            .map(|v| v as i8);
                         }
                         self.local_bands[i] = db;
                         self.bands_dirty = true;
@@ -1030,7 +1136,6 @@ impl BudsGuiApp {
                     self.send(UserCommand::SetCustomEqualizer(self.local_bands));
                 }
 
-                // Thumb circle
                 let hovered = band_resp.hovered() || band_resp.dragged();
                 ui.painter().circle_filled(
                     pt,
@@ -1043,8 +1148,7 @@ impl BudsGuiApp {
                     Stroke::new(2.0_f32, BG_BASE),
                 );
 
-                // Value label above thumb
-                let db_val = values[i] as i8;
+                let db_val = values[i].round() as i8;
                 let db_str = if db_val > 0 {
                     format!("+{db_val}")
                 } else {
@@ -1058,7 +1162,6 @@ impl BudsGuiApp {
                     if db_val != 0 { ACCENT_CYAN } else { TEXT_MUTED },
                 );
 
-                // Frequency label below track
                 ui.painter().text(
                     Pos2::new(pt.x, rect.bottom() - 10.0),
                     egui::Align2::CENTER_CENTER,
@@ -1175,7 +1278,6 @@ impl BudsGuiApp {
 
         ui.add_space(8.0);
 
-        // Find My Earbuds Card
         Self::card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1249,7 +1351,6 @@ impl BudsGuiApp {
 
         ui.add_space(8.0);
 
-        // Hardware & Telemetry Card
         Self::card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1346,11 +1447,17 @@ impl eframe::App for BudsGuiApp {
         }
 
         if self.show_gui_flag.swap(false, Ordering::SeqCst) {
+            // Re-trigger the smooth entrance and battery sweep animation when reopening from tray!
+            let now = Instant::now();
+            self.launch_instant = now;
+            self.anim_batt_left = 0.0;
+            self.anim_batt_right = 0.0;
+            self.anim_batt_case = 0.0;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
-        if self.last_sync.elapsed() >= Duration::from_millis(100) {
+        if self.last_sync.elapsed() >= Duration::from_millis(90) {
             if let Ok(guard) = self.state.try_read() {
                 self.snapshot = guard.clone();
                 if !self.bands_dirty {
@@ -1360,9 +1467,28 @@ impl eframe::App for BudsGuiApp {
             self.last_sync = Instant::now();
         }
 
-        ctx.request_repaint_after(Duration::from_millis(150));
+        let is_animating = self.step_animations();
+        if is_animating {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+
+        let since_launch = self.launch_instant.elapsed().as_secs_f32();
+        let launch_ease = ease_out_cubic(since_launch / 0.55);
+
+        let tab_elapsed = self.tab_transition_instant.elapsed().as_secs_f32();
+        let tab_ease = ease_out_cubic(tab_elapsed / 0.26);
+        let tab_offset_x = self.tab_slide_dir * 26.0 * (1.0 - tab_ease);
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Smooth entrance vertical offset and fade-in on startup
+            ui.set_opacity(launch_ease);
+            let entrance_y = (1.0 - launch_ease) * 14.0;
+            if entrance_y > 0.1 {
+                ui.add_space(entrance_y);
+            }
+
             // --- Top App Header Bar ---
             ui.horizontal(|ui| {
                 // Custom App Icon Badge in Header
@@ -1375,16 +1501,22 @@ impl eframe::App for BudsGuiApp {
                     egui::StrokeKind::Inside,
                 );
                 let lc = logo_rect.center();
-                // Left mini blade bud
-                ui.painter().circle_filled(Pos2::new(lc.x - 6.0, lc.y - 6.0), 4.8, TEXT_PRIMARY);
+                ui.painter()
+                    .circle_filled(Pos2::new(lc.x - 6.0, lc.y - 6.0), 4.8, TEXT_PRIMARY);
                 ui.painter().line_segment(
-                    [Pos2::new(lc.x - 7.5, lc.y - 4.0), Pos2::new(lc.x - 4.5, lc.y + 10.0)],
+                    [
+                        Pos2::new(lc.x - 7.5, lc.y - 4.0),
+                        Pos2::new(lc.x - 4.5, lc.y + 10.0),
+                    ],
                     Stroke::new(3.0_f32, ACCENT_CYAN),
                 );
-                // Right mini blade bud
-                ui.painter().circle_filled(Pos2::new(lc.x + 6.0, lc.y - 6.0), 4.8, TEXT_PRIMARY);
+                ui.painter()
+                    .circle_filled(Pos2::new(lc.x + 6.0, lc.y - 6.0), 4.8, TEXT_PRIMARY);
                 ui.painter().line_segment(
-                    [Pos2::new(lc.x + 7.5, lc.y - 4.0), Pos2::new(lc.x + 4.5, lc.y + 10.0)],
+                    [
+                        Pos2::new(lc.x + 7.5, lc.y - 4.0),
+                        Pos2::new(lc.x + 4.5, lc.y + 10.0),
+                    ],
                     Stroke::new(3.0_f32, ACCENT_CYAN),
                 );
 
@@ -1399,7 +1531,6 @@ impl eframe::App for BudsGuiApp {
                                 .color(TEXT_PRIMARY),
                         );
 
-                        // Live Connection Status Pill
                         let (status_txt, dot_color, bg_pill) = if self.snapshot.connected {
                             ("Conectado", STATUS_GREEN, Color32::from_rgb(16, 46, 38))
                         } else {
@@ -1439,7 +1570,7 @@ impl eframe::App for BudsGuiApp {
                     );
                 });
 
-                // Top-Right Navigation Tabs Pill Bar
+                // Top-Right Navigation Tabs Pill Bar with Animated Sliding Indicator
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     egui::Frame::NONE
                         .fill(BG_CARD)
@@ -1452,25 +1583,63 @@ impl eframe::App for BudsGuiApp {
                                 (ActiveTab::Equalizer, "Equalizador"),
                                 (ActiveTab::SoundControl, "Controle de Som"),
                             ];
+                            let mut active_rect: Option<Rect> = None;
+                            let mut clicked_tab: Option<ActiveTab> = None;
+
+                            // Reserve a background layer shape slot for the sliding blue pill
+                            let pill_shape_idx = ui.painter().add(egui::Shape::Noop);
+
                             for (tab, label) in tabs {
                                 let active = self.active_tab == tab;
+                                let anim_col = ui
+                                    .ctx()
+                                    .animate_bool(Id::new(("tab_txt_col", tab.index())), active);
                                 let btn = egui::Button::new(
                                     RichText::new(label)
                                         .size(12.5)
                                         .strong()
-                                        .color(if active { Color32::WHITE } else { TEXT_SECONDARY }),
+                                        .color(lerp_color(TEXT_SECONDARY, Color32::WHITE, anim_col)),
                                 )
-                                .fill(if active {
-                                    ACCENT_BLUE
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
+                                .fill(Color32::TRANSPARENT)
                                 .stroke(Stroke::NONE)
                                 .corner_radius(CornerRadius::same(8));
 
-                                if ui.add(btn).clicked() {
-                                    self.active_tab = tab;
+                                let resp = ui.add(btn);
+                                if active {
+                                    active_rect = Some(resp.rect);
                                 }
+                                if resp.clicked() {
+                                    clicked_tab = Some(tab);
+                                }
+                            }
+
+                            if let Some(target_r) = active_rect {
+                                let anim_left = ui.ctx().animate_value_with_time(
+                                    Id::new("nav_pill_left"),
+                                    target_r.left(),
+                                    0.20,
+                                );
+                                let anim_right = ui.ctx().animate_value_with_time(
+                                    Id::new("nav_pill_right"),
+                                    target_r.right(),
+                                    0.20,
+                                );
+                                let pill_rect = Rect::from_min_max(
+                                    Pos2::new(anim_left, target_r.top()),
+                                    Pos2::new(anim_right, target_r.bottom()),
+                                );
+                                ui.painter().set(
+                                    pill_shape_idx,
+                                    egui::Shape::rect_filled(
+                                        pill_rect,
+                                        CornerRadius::same(8),
+                                        ACCENT_BLUE,
+                                    ),
+                                );
+                            }
+
+                            if let Some(next) = clicked_tab {
+                                self.switch_tab(next);
                             }
                         });
                 });
@@ -1493,6 +1662,7 @@ impl eframe::App for BudsGuiApp {
                     "Fone Esquerdo (L)",
                     "L",
                     self.snapshot.battery_left,
+                    self.anim_batt_left,
                     self.snapshot.is_left_charging,
                     Some(self.snapshot.placement_left),
                     Some(self.snapshot.temp_left_c),
@@ -1503,6 +1673,7 @@ impl eframe::App for BudsGuiApp {
                     "Fone Direito (R)",
                     "R",
                     self.snapshot.battery_right,
+                    self.anim_batt_right,
                     self.snapshot.is_right_charging,
                     Some(self.snapshot.placement_right),
                     Some(self.snapshot.temp_right_c),
@@ -1513,6 +1684,7 @@ impl eframe::App for BudsGuiApp {
                     "Estojo de Carga",
                     "CASE",
                     self.snapshot.battery_case,
+                    self.anim_batt_case,
                     self.snapshot.is_case_charging && any_bud_in_open_case,
                     None,
                     None,
@@ -1522,14 +1694,19 @@ impl eframe::App for BudsGuiApp {
 
             ui.add_space(12.0);
 
-            // --- Active Tab Content Area ---
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| match self.active_tab {
-                    ActiveTab::SoundControl => self.render_sound_control_tab(ui),
-                    ActiveTab::Equalizer => self.render_equalizer_tab(ui),
-                    ActiveTab::TouchAndSystem => self.render_touch_and_system_tab(ui),
-                });
+            // --- Animated Active Tab Content Area (Slide + Cross-Fade) ---
+            let avail = ui.available_rect_before_wrap();
+            let shifted_rect = avail.translate(Vec2::new(tab_offset_x, 0.0));
+            ui.scope_builder(UiBuilder::new().max_rect(shifted_rect), |ui| {
+                ui.set_opacity(launch_ease * tab_ease);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.active_tab {
+                        ActiveTab::SoundControl => self.render_sound_control_tab(ui),
+                        ActiveTab::Equalizer => self.render_equalizer_tab(ui),
+                        ActiveTab::TouchAndSystem => self.render_touch_and_system_tab(ui),
+                    });
+            });
         });
     }
 }
