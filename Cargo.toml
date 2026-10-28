@@ -1,6 +1,6 @@
 [package]
 name = "buds4pro"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Gerenciador nativo em Rust para Samsung Galaxy Buds 4 Pro (CLI, System Tray e GUI)"
 

@@ -17,7 +17,7 @@ use tray::spawn_system_tray;
 #[derive(Parser)]
 #[command(
     name = "buds4pro",
-    version = "0.1.0",
+    version = "0.2.0",
     about = "Gerenciador completo em Rust para Samsung Galaxy Buds 4 Pro (CLI, System Tray e GUI)"
 )]
 struct Cli {
@@ -245,8 +245,8 @@ fn run_gui_mode() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([620.0, 720.0])
-            .with_min_inner_size([520.0, 560.0])
+            .with_inner_size([760.0, 740.0])
+            .with_min_inner_size([640.0, 620.0])
             .with_title("Galaxy Buds4 Pro — Gerenciador Linux"),
         ..Default::default()
     };
